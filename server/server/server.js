@@ -7,20 +7,17 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load env files in a robust way:
-// - Base files first (.env), then local overrides (.env.local)
-// - Prefer server/ folder, then project root fallback
+// Load env files in a robust way (server/.env first)
 const envFilesInOrder = [
-  path.join(__dirname, '.env'),              // server/.env (base)
-  path.join(__dirname, '.env.local'),        // server/.env.local (overrides)
-  path.join(__dirname, '../.env'),           // root/.env (base fallback)
-  path.join(__dirname, '../.env.local'),     // root/.env.local (overrides)
+  path.join(__dirname, '.env'),
+  path.join(__dirname, '.env.local'),
+  path.join(__dirname, '../.env'),
+  path.join(__dirname, '../.env.local'),
 ];
 
 let loadedEnvFiles = [];
 for (const p of envFilesInOrder) {
   if (fs.existsSync(p)) {
-    // For base files, don't override existing env; for .env.local, allow override of previously parsed
     const isLocal = p.endsWith('.env.local');
     const result = dotenv.config({ path: p, override: isLocal });
     loadedEnvFiles.push({
@@ -31,8 +28,6 @@ for (const p of envFilesInOrder) {
     });
   }
 }
-
-// One-time sanity log (comment out later if you want)
 console.log('ENV LOAD ->', loadedEnvFiles);
 console.log('ENV CHECK -> PORT:', process.env.PORT);
 console.log('ENV CHECK -> MONGODB_URI set?', Boolean(process.env.MONGODB_URI));
@@ -51,15 +46,13 @@ import { Server } from 'socket.io';
 import GridFS from 'gridfs-stream';
 import passport, { configurePassport } from './config/passport.js';
 
-// Routes (AI routes will be imported dynamically after polyfills)
+// Routes
 import authRoutes from './routes/auth.js';
 import jobRoutes from './routes/jobs.js';
 import applicationRoutes from './routes/applications.js';
 import messageRoutes from './routes/messages.js';
 import userRoutes from './routes/users.js';
 import fileRoutes from './routes/files.js';
-// import adminRoutes from './routes/admin.js';
-
 import { handleSocketConnection } from './socket/socketHandlers.js';
 
 const app = express();
@@ -74,79 +67,36 @@ const io = new Server(server, {
 
 // Security middleware
 app.use(helmet());
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    credentials: true,
-  })
-);
+app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
 
-// Rate limiting (use env if provided)
+// Rate limiting
 const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000;
 const maxReq = Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100;
-const limiter = rateLimit({ windowMs, max: maxReq });
-app.use(limiter);
+app.use(rateLimit({ windowMs, max: maxReq }));
 
 // General middleware
+const bodyLimit = process.env.MAX_FILE_SIZE ? String(process.env.MAX_FILE_SIZE) : '10mb';
 app.use(compression());
 app.use(morgan('combined'));
-app.use(express.json({ limit: process.env.MAX_FILE_SIZE ? String(process.env.MAX_FILE_SIZE) : '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: process.env.MAX_FILE_SIZE ? String(process.env.MAX_FILE_SIZE) : '10mb' }));
+app.use(express.json({ limit: bodyLimit }));
+app.use(express.urlencoded({ extended: true, limit: bodyLimit }));
 
-// Initialize Passport (required for passport.authenticate handlers)
+// Initialize Passport
 app.use(passport.initialize());
-
-// ---------- MongoDB connection helpers ----------
-const MONGO_HOST = process.env.MONGO_HOST || 'cluster0.hw1xy3a.mongodb.net';
-const MONGO_DB = process.env.MONGO_DB || 'jobhub';
-const MONGO_USER = process.env.MONGO_USER;
-const MONGO_PASS = process.env.MONGO_PASS;
-
-// Build a safe Mongo URI. Priority:
-// 1) MONGODB_URI (as-is, trust user to URL-encode password)
-// 2) Construct from parts with safe encoding
-function makeMongoUri() {
-  if (process.env.MONGODB_URI) {
-    return process.env.MONGODB_URI;
-  }
-  if (!MONGO_USER || !MONGO_PASS) {
-    throw new Error('MONGODB_URI or MONGO_USER/MONGO_PASS must be set. Put them in server/.env');
-  }
-  const user = encodeURIComponent(MONGO_USER);
-  const pass = encodeURIComponent(MONGO_PASS);
-  const authSourceParam = process.env.MONGO_AUTH_SOURCE ? `&authSource=${encodeURIComponent(process.env.MONGO_AUTH_SOURCE)}` : '';
-  const appNameParam = process.env.MONGO_APP_NAME ? encodeURIComponent(process.env.MONGO_APP_NAME) : 'Cluster0';
-  return `mongodb+srv://${user}:${pass}@${MONGO_HOST}/${encodeURIComponent(MONGO_DB)}?retryWrites=true&w=majority&appName=${appNameParam}${authSourceParam}`;
-}
 
 // MongoDB
 const connectDB = async () => {
   try {
-    const uri = makeMongoUri();
-
-    // Optional: small timeout/selection tuning can help during dev
-    const conn = await mongoose.connect(uri, {
-      // Mongoose 7+ uses sensible defaults; these are left out intentionally
-      serverSelectionTimeoutMS: 15000,
-      // tls: true, // Atlas uses TLS by default (inferred from SRV)
-    });
-
-    console.log(`MongoDB Connected: host=${conn.connection.host} db=${conn.connection.name}`);
+    const uri = process.env.MONGODB_URI;
+    if (!uri) throw new Error('MONGODB_URI is not set. Put it in server/.env');
+    const conn = await mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true });
+    console.log(`MongoDB Connected: ${conn.connection.host}`);
 
     const gfs = GridFS(conn.connection.db, mongoose.mongo);
     gfs.collection('uploads');
     app.set('gfs', gfs);
   } catch (error) {
-    // Helpful hints for common failure modes
-    if (/bad auth|authentication failed/i.test(String(error?.message))) {
-      console.error('Database connection error: Authentication failed. Check username/password. If password has special characters, ensure it is URL-encoded or use MONGO_USER/MONGO_PASS variables.');
-    } else if (/ENOTFOUND|getaddrinfo/i.test(String(error?.message))) {
-      console.error('Database connection error: DNS resolution failed. Check network or cluster hostname.');
-    } else if (/timed out|server selection/i.test(String(error?.message))) {
-      console.error('Database connection error: Could not reach Atlas. Ensure your IP is whitelisted in Atlas Network Access.');
-    } else {
-      console.error('Database connection error:', error);
-    }
+    console.error('Database connection error:', error);
     process.exit(1);
   }
 };
@@ -184,7 +134,6 @@ app.use('/api/applications', applicationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/files', fileRoutes);
-// app.use('/api/admin', adminRoutes);
 
 // Import AI routes AFTER polyfills
 try {
@@ -195,7 +144,7 @@ try {
   console.warn('AI routes not loaded:', e.message);
 }
 
-// Health
+// Health (rich)
 app.get('/api/health', (req, res) => {
   const states = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
   res.json({
@@ -204,8 +153,8 @@ app.get('/api/health', (req, res) => {
     db: {
       state: states[mongoose.connection.readyState],
       host: mongoose.connection?.host || null,
-      name: mongoose.connection?.name || null,
-    },
+      name: mongoose.connection?.name || null
+    }
   });
 });
 
@@ -214,7 +163,7 @@ app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({
     message: 'Something went wrong!',
-    error: process.env.NODE_ENV === 'development' ? err.message : {},
+    error: process.env.NODE_ENV === 'development' ? err.message : {}
   });
 });
 

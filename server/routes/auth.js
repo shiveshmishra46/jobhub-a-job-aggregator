@@ -13,6 +13,53 @@ const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
 };
 
+// ---------- Google OAuth Routes ----------
+
+// Quick diagnostic to ensure env is wired
+router.get('/google/check', (req, res) => {
+  res.json({
+    ok: true,
+    client_id_present: Boolean(process.env.GOOGLE_CLIENT_ID),
+    callback_url: process.env.GOOGLE_CALLBACK_URL || '/api/auth/google/callback'
+  });
+});
+
+// Initiate Google OAuth — IMPORTANT: scope must be present
+router.get(
+  '/google',
+  passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    prompt: 'select_account',
+    accessType: 'offline'
+  })
+);
+
+// Handle Google OAuth callback
+router.get(
+  '/google/callback',
+  passport.authenticate('google', {
+    session: false,
+    failureRedirect: `${process.env.CLIENT_URL}/login?error=oauth_failed`
+  }),
+  async (req, res) => {
+    try {
+      const token = generateToken(req.user._id);
+      const redirectUrl = `${process.env.CLIENT_URL}/auth/callback?token=${token}`;
+      return res.redirect(redirectUrl);
+    } catch (error) {
+      console.error('Google OAuth callback error:', error);
+      return res.redirect(`${process.env.CLIENT_URL}/login?error=oauth_failed`);
+    }
+  }
+);
+
+// Optional explicit failure route if you want to debug
+router.get('/google/failure', (req, res) => {
+  res.status(401).json({ message: 'Google OAuth failed' });
+});
+
+// ---------- Email/Password Auth (unchanged) ----------
+
 // Register
 router.post('/register', [
   body('name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
@@ -23,31 +70,22 @@ router.post('/register', [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ 
-        message: 'Validation failed', 
-        errors: errors.array() 
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
       });
     }
 
     const { name, email, password, role } = req.body;
 
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists with this email' });
     }
 
-    // Create new user
-    const user = new User({
-      name,
-      email,
-      password,
-      role
-    });
-
+    const user = new User({ name, email, password, role });
     await user.save();
 
-    // Generate token
     const token = generateToken(user._id);
 
     res.status(201).json({
@@ -70,49 +108,38 @@ router.post('/login', [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ 
-        message: 'Validation failed', 
-        errors: errors.array() 
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
       });
     }
 
     const { email, password } = req.body;
 
-    // Find user
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials' });
-    }
+    if (!user) return res.status(400).json({ message: 'Invalid credentials' });
 
-    // Check if account is locked
     if (user.isLocked) {
-      return res.status(423).json({ 
-        message: 'Account temporarily locked due to too many failed login attempts' 
+      return res.status(423).json({
+        message: 'Account temporarily locked due to too many failed login attempts'
       });
     }
 
-    // Check if account is active
     if (!user.isActive) {
       return res.status(401).json({ message: 'Account is deactivated' });
     }
 
-    // Verify password
     const isValidPassword = await user.comparePassword(password);
     if (!isValidPassword) {
       await user.incLoginAttempts();
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    // Reset login attempts on successful login
-    if (user.loginAttempts > 0) {
-      await user.resetLoginAttempts();
-    }
+    if (user.loginAttempts > 0) await user.resetLoginAttempts();
 
-    // Update last login
     user.lastLogin = new Date();
     await user.save();
 
-    // Generate token
     const token = generateToken(user._id);
 
     res.json({
@@ -127,35 +154,13 @@ router.post('/login', [
   }
 });
 
-// Google OAuth routes
-router.get('/google', 
-  passport.authenticate('google', { scope: ['profile', 'email'] })
-);
-
-router.get('/google/callback',
-  passport.authenticate('google', { session: false }),
-  async (req, res) => {
-    try {
-      const token = generateToken(req.user._id);
-      
-      // Redirect to frontend with token
-      const redirectUrl = `${process.env.CLIENT_URL}/auth/callback?token=${token}`;
-      res.redirect(redirectUrl);
-      
-    } catch (error) {
-      console.error('Google OAuth callback error:', error);
-      res.redirect(`${process.env.CLIENT_URL}/login?error=oauth_failed`);
-    }
-  }
-);
-
 // Get current user
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
       .populate('profile.resume')
       .populate('profile.profilePicture');
-    
+
     res.json(user.getPublicProfile());
   } catch (error) {
     console.error('Get user error:', error);
@@ -174,9 +179,9 @@ router.put('/profile', authenticateToken, [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ 
-        message: 'Validation failed', 
-        errors: errors.array() 
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
       });
     }
 
@@ -206,22 +211,20 @@ router.put('/change-password', authenticateToken, [
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ 
-        message: 'Validation failed', 
-        errors: errors.array() 
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
       });
     }
 
     const { currentPassword, newPassword } = req.body;
     const user = await User.findById(req.user._id);
 
-    // Verify current password
     const isValidPassword = await user.comparePassword(currentPassword);
     if (!isValidPassword) {
       return res.status(400).json({ message: 'Current password is incorrect' });
     }
 
-    // Update password
     user.password = newPassword;
     await user.save();
 
@@ -233,10 +236,9 @@ router.put('/change-password', authenticateToken, [
   }
 });
 
-// Logout (client-side token removal, but we can log it)
+// Logout
 router.post('/logout', authenticateToken, async (req, res) => {
   try {
-    // Could implement token blacklisting here if needed
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
     console.error('Logout error:', error);
