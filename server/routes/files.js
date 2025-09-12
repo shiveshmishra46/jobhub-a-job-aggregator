@@ -1,64 +1,62 @@
 import express from 'express';
 import multer from 'multer';
-import GridFS from 'gridfs-stream';
 import mongoose from 'mongoose';
 import { authenticateToken } from '../middleware/auth.js';
 import User from '../models/User.js';
-import pdf from 'pdf-parse';
 
 const router = express.Router();
 
-// Configure multer for memory storage
+// Multer memory storage for small files like resumes/avatars
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
-    // Allow images, PDFs, and documents
-    if (file.mimetype.startsWith('image/') || 
-        file.mimetype === 'application/pdf' ||
-        file.mimetype.includes('document')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only images, PDF, and document files are allowed'), false);
-    }
+    const allowed = [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ];
+    const isImage = file.mimetype.startsWith('image/');
+    if (isImage || allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only images, PDF, and DOC/DOCX files are allowed'), false);
   }
 });
 
-// Initialize GridFS
-let gfs;
-mongoose.connection.once('open', () => {
-  gfs = GridFS(mongoose.connection.db, mongoose.mongo);
-  gfs.collection('uploads');
-});
+// Safe helper to fetch shared GridFS instance
+function getGFS(req) {
+  const gfs = req.app.get('gfs');
+  if (!gfs) throw new Error('GridFS not initialized');
+  return gfs;
+}
 
-// Upload resume and extract text
+// Upload resume, extract text (PDF supported), store in GridFS with metadata
 router.post('/upload-resume', authenticateToken, upload.single('resume'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
     let extractedText = '';
 
-    // Extract text based on file type
     if (req.file.mimetype === 'application/pdf') {
-      const pdfData = await pdf(req.file.buffer);
-      extractedText = pdfData.text;
-    } else if (req.file.mimetype.includes('document')) {
-      // For DOC/DOCX files, you'd need a library like mammoth
+      try {
+        const { default: pdf } = await import('pdf-parse'); // lazy import to avoid startup crash
+        const pdfData = await pdf(req.file.buffer);
+        extractedText = pdfData.text || '';
+      } catch (err) {
+        console.warn('PDF extraction unavailable:', err.message);
+        extractedText = '';
+      }
+    } else if (
+      req.file.mimetype === 'application/msword' ||
+      req.file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
       extractedText = 'Document text extraction not implemented yet';
-    } else {
+    } else if (!req.file.mimetype.startsWith('image/')) {
       return res.status(400).json({ message: 'Unsupported file type for text extraction' });
     }
 
-    if (!gfs) {
-      return res.status(500).json({ message: 'GridFS not initialized' });
-    }
+    const gfs = getGFS(req);
 
-    // Save file to GridFS
     const writeStream = gfs.createWriteStream({
       filename: `${req.user._id}_resume_${Date.now()}_${req.file.originalname}`,
       contentType: req.file.mimetype,
@@ -67,13 +65,12 @@ router.post('/upload-resume', authenticateToken, upload.single('resume'), async 
         fileType: 'resume',
         originalName: req.file.originalname,
         uploadDate: new Date(),
-        extractedText: extractedText
+        extractedText
       }
     });
 
     writeStream.on('close', async (file) => {
       try {
-        // Update user profile with resume reference
         await User.findByIdAndUpdate(req.user._id, {
           'profile.resume': {
             fileId: file._id,
@@ -93,7 +90,6 @@ router.post('/upload-resume', authenticateToken, upload.single('resume'), async 
             size: file.length
           }
         });
-
       } catch (error) {
         console.error('Error updating user profile:', error);
         res.status(500).json({ message: 'Error updating user profile' });
@@ -105,134 +101,136 @@ router.post('/upload-resume', authenticateToken, upload.single('resume'), async 
       res.status(500).json({ message: 'Error uploading file' });
     });
 
-    // Write file buffer to GridFS
     writeStream.end(req.file.buffer);
-
   } catch (error) {
-    console.error('Resume upload error:', error);
+    console.error('Upload resume error:', error);
     res.status(500).json({ message: 'Server error during resume upload' });
   }
 });
 
-// Upload file (general)
-router.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
+// Stream a file by id
+router.get('/:id', async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
-    }
+    const gfs = getGFS(req);
+    const fileId = new mongoose.Types.ObjectId(req.params.id);
 
-    const { fileType } = req.body; // 'resume', 'profilePicture', 'companyLogo'
+    gfs.files.findOne({ _id: fileId }, (err, file) => {
+      if (err || !file) return res.status(404).json({ message: 'File not found' });
 
-    if (!gfs) {
-      return res.status(500).json({ message: 'GridFS not initialized' });
-    }
+      res.set('Content-Type', file.contentType || 'application/octet-stream');
+      res.set('Content-Disposition', `inline; filename="${file.filename}"`);
 
-    // Create GridFS write stream
-    const writeStream = gfs.createWriteStream({
-      filename: `${req.user._id}_${fileType}_${Date.now()}_${req.file.originalname}`,
-      contentType: req.file.mimetype,
-      metadata: {
-        userId: req.user._id,
-        fileType,
-        originalName: req.file.originalname,
-        uploadDate: new Date()
-      }
+      const readStream = gfs.createReadStream({ _id: fileId, root: 'uploads' });
+      readStream.on('error', (e) => {
+        console.error('GridFS read error:', e);
+        res.status(500).end();
+      });
+      readStream.pipe(res);
     });
-
-    // Handle stream events
-    writeStream.on('close', async (file) => {
-      try {
-        // Update user profile with file reference
-        const updateData = {};
-        
-        if (fileType === 'resume') {
-          updateData['profile.resume'] = {
-            fileId: file._id,
-            filename: file.filename,
-            contentType: file.contentType,
-            uploadDate: new Date()
-          };
-        } else if (fileType === 'profilePicture') {
-          updateData['profile.profilePicture'] = {
-            fileId: file._id,
-            filename: file.filename,
-            contentType: file.contentType
-          };
-        } else if (fileType === 'companyLogo') {
-          updateData['company.logo'] = {
-            fileId: file._id,
-            filename: file.filename,
-            contentType: file.contentType
-          };
-        }
-
-        await User.findByIdAndUpdate(req.user._id, updateData);
-
-        res.json({
-          message: 'File uploaded successfully',
-          file: {
-            id: file._id,
-            filename: file.filename,
-            contentType: file.contentType,
-            size: file.length,
-            uploadDate: file.uploadDate
-          }
-        });
-
-      } catch (error) {
-        console.error('Error updating user profile:', error);
-        res.status(500).json({ message: 'Error updating user profile' });
-      }
-    });
-
-    writeStream.on('error', (error) => {
-      console.error('GridFS write error:', error);
-      res.status(500).json({ message: 'Error uploading file' });
-    });
-
-    // Write file buffer to GridFS
-    writeStream.end(req.file.buffer);
-
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ message: 'Server error during file upload' });
+    console.error('Get file error:', error);
+    res.status(500).json({ message: 'Server error retrieving file' });
   }
 });
 
-// Get file by ID
-router.get('/:id', async (req, res) => {
+// Download a file as attachment
+router.get('/:id/download', async (req, res) => {
   try {
-    if (!gfs) {
-      return res.status(500).json({ message: 'GridFS not initialized' });
-    }
+    const gfs = getGFS(req);
+    const fileId = new mongoose.Types.ObjectId(req.params.id);
 
-    const file = await gfs.files.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
+    gfs.files.findOne({ _id: fileId }, (err, file) => {
+      if (err || !file) return res.status(404).json({ message: 'File not found' });
 
-    if (!file) {
-      return res.status(404).json({ message: 'File not found' });
-    }
-
-    // Set appropriate headers
-    if (file.contentType.startsWith('image/')) {
-      res.set('Content-Type', file.contentType);
-    } else {
       res.set('Content-Type', 'application/octet-stream');
       res.set('Content-Disposition', `attachment; filename="${file.filename}"`);
-    }
 
-    // Create read stream
-    const readStream = gfs.createReadStream({ _id: file._id });
-    
-    readStream.on('error', (error) => {
-      console.error('GridFS read error:', error);
-      res.status(500).json({ message: 'Error reading file' });
+      const readStream = gfs.createReadStream({ _id: fileId, root: 'uploads' });
+      readStream.on('error', (e) => {
+        console.error('GridFS read error:', e);
+        res.status(500).end();
+      });
+      readStream.pipe(res);
     });
-
-    readStream.pipe(res);
-
   } catch (error) {
-    console.error('Get file error:', error);
-    res.status(500).json({ message: 'Server error while fetching file' });
+    console.error('Download file error:', error);
+    res.status(500).json({ message: 'Server error downloading file' });
+  }
+});
+
+// Get file metadata
+router.get('/:id/meta', async (req, res) => {
+  try {
+    const gfs = getGFS(req);
+    const fileId = new mongoose.Types.ObjectId(req.params.id);
+
+    gfs.files.findOne({ _id: fileId }, (err, file) => {
+      if (err || !file) return res.status(404).json({ message: 'File not found' });
+      res.json({
+        id: file._id,
+        filename: file.filename,
+        length: file.length,
+        contentType: file.contentType,
+        uploadDate: file.uploadDate,
+        metadata: file.metadata || {}
+      });
+    });
+  } catch (error) {
+    console.error('Get metadata error:', error);
+    res.status(500).json({ message: 'Server error getting file metadata' });
+  }
+});
+
+// List current user's files
+router.get('/user/me/list', authenticateToken, async (req, res) => {
+  try {
+    const gfs = getGFS(req);
+    gfs.files.find({ 'metadata.userId': req.user._id }).toArray((err, files) => {
+      if (err) {
+        console.error('List files error:', err);
+        return res.status(500).json({ message: 'Error listing files' });
+      }
+      res.json({
+        files: (files || []).map(f => ({
+          id: f._id,
+          filename: f.filename,
+          length: f.length,
+          contentType: f.contentType,
+          uploadDate: f.uploadDate,
+          metadata: f.metadata || {}
+        }))
+      });
+    });
+  } catch (error) {
+    console.error('List user files error:', error);
+    res.status(500).json({ message: 'Server error listing files' });
+  }
+});
+
+// Delete a file by id (owner or admin)
+router.delete('/:id', authenticateToken, async (req, res) => {
+  try {
+    const gfs = getGFS(req);
+    const fileId = new mongoose.Types.ObjectId(req.params.id);
+
+    gfs.files.findOne({ _id: fileId }, (err, file) => {
+      if (err || !file) return res.status(404).json({ message: 'File not found' });
+
+      const isOwner = file.metadata?.userId?.toString?.() === req.user._id.toString();
+      const isAdmin = req.user.role === 'admin';
+      if (!isOwner && !isAdmin) return res.status(403).json({ message: 'Not authorized to delete this file' });
+
+      gfs.remove({ _id: fileId, root: 'uploads' }, (removeErr) => {
+        if (removeErr) {
+          console.error('GridFS remove error:', removeErr);
+          return res.status(500).json({ message: 'Error deleting file' });
+        }
+        res.json({ message: 'File deleted successfully' });
+      });
+    });
+  } catch (error) {
+    console.error('Delete file error:', error);
+    res.status(500).json({ message: 'Server error deleting file' });
   }
 });
 

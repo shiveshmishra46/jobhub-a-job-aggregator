@@ -1,6 +1,9 @@
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
 import axios from 'axios';
 
+// Set baseURL so requests go directly to backend (port 5000), not 5173
+axios.defaults.baseURL = import.meta.env?.VITE_API_URL || 'http://localhost:5000';
+
 const AuthContext = createContext();
 
 const authReducer = (state, action) => {
@@ -87,7 +90,7 @@ export const AuthProvider = ({ children }) => {
         }
       });
     } catch (error) {
-      console.error('Auth verification failed:', error);
+      console.error('Auth verification failed:', error?.response?.status, error?.response?.data);
       logout();
     }
   };
@@ -139,6 +142,7 @@ export const AuthProvider = ({ children }) => {
 
       return { success: true, user };
     } catch (error) {
+      console.error('Register error:', error?.response?.status, error?.response?.data);
       const errorMessage = error.response?.data?.message || 'Registration failed';
       dispatch({
         type: 'LOGIN_FAILURE',
